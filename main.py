@@ -1,299 +1,192 @@
-"""
-Niho Ride - Location Service (FastAPI, Google Maps edition)
--------------------------------------------------------------
-Fixes applied to the version you had running on Render:
-
-1. `/share-location` and `/shared-location/{id}` were MISSING entirely.
-   The Flutter app already calls `/share-location` (the "ሎኬሽን አጋራ" button) —
-   without this route, that feature would 404 with FastAPI's bare
-   `{"detail":"Not Found"}`, the exact error you saw earlier.
-2. `GOOGLE_MAPS_API_KEY` was silently left as a placeholder if unset. Every
-   geocode/route call would then fail with Google's "REQUEST_DENIED", which
-   your old code mislabeled as "ቦታው አልተገኘም" (place not found) — the real
-   problem (missing/invalid key) was hidden. Now it's checked up front and
-   reported clearly.
-3. Google's various error statuses (ZERO_RESULTS, OVER_QUERY_LIMIT,
-   REQUEST_DENIED, INVALID_REQUEST) were all collapsed into one generic
-   404. Each now gets its own message so you know which one you're hitting.
-4. Network failures (timeouts, DNS errors, Render cold-start hiccups) to the
-   Google API weren't caught — they'd bubble up as an unhandled 500. Now
-   wrapped and reported as a clear 502.
-5. `decode_polyline` had no bounds/format checking — a malformed or
-   truncated polyline string would raise an uncaught IndexError (500).
-   Now wrapped with a clear error instead.
-6. Added a `__main__` block using Render's `$PORT` env var, in case your
-   start command isn't already passing `--port $PORT` explicitly.
-
-Run locally:
-  pip install -r requirements.txt
-  export GOOGLE_MAPS_API_KEY=your_real_key_here
-  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-
-On Render:
-  Set GOOGLE_MAPS_API_KEY under Environment → Environment Variables.
-  Make sure the Geocoding API AND Directions API are both enabled for that
-  key in Google Cloud Console, and billing is enabled on the project —
-  Google will return REQUEST_DENIED otherwise, even with a valid-looking key.
-"""
-
 import os
-import uuid
-from datetime import datetime, timedelta, timezone
+import cv2
+import numpy as np
+import face_recognition
+from flask import Flask, render_template_string, Response, jsonify, request
+from base64 import b64decode
+from IPython.display import display, Javascript
+from google.colab.output import eval_js
+import threading
 
-import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+app = Flask(__name__)
+KNOWN_FACES_DIR = "known_faces"
+os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
 
-app = FastAPI(title="Niho Ride Location Service", version="2.1.0")
+known_face_encodings = []
+known_face_names = []
+attendance_records = set()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def load_known_faces():
+ global known_face_encodings, known_face_names
+ known_face_encodings = []
+ known_face_names = []
+ for file in os.listdir(KNOWN_FACES_DIR):
+ if file.endswith(('.jpg', '.png', '.jpeg')):
+ path = os.path.join(KNOWN_FACES_DIR, file)
+ image = face_recognition.load_image_file(path)
+ encodings = face_recognition.face_encodings(image)
+ if encodings:
+ known_face_encodings.append(encodings[0])
+ known_face_names.append(os.path.splitext(file)[0])
 
-# 🔑 Set this as a real Environment Variable on Render — never hardcode a key
-# in source control.
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
+load_known_faces()
 
-# In-memory store for shared locations. Fine for a single Render instance /
-# testing; swap for a real DB (e.g. Supabase) so links survive restarts and
-# work if you ever scale to multiple instances.
-shared_locations: dict[str, dict] = {}
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="am">
+<head>
+ <meta charset="UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1.0">
+ <title>Student Attendance</title>
+ <style>
+ :root { --bg: #121212; --card: #1e1e1e; --text: #ffffff; --accent: #00e676; --border: #333333; }
+ body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+ .container { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 2fr 1fr; gap: 20px; }
+ .card { background-color: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+ h2 { margin-top: 0; color: var(--accent); }
+ #videoElement { width: 100%; border-radius: 8px; border: 2px solid var(--border); display: block; }
+ form { display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }
+ input[type="text"], button { padding: 10px; border-radius: 6px; border: 1px solid var(--border); background-color: #2a2a2a; color: #fff; }
+ button { background-color: var(--accent); color: #000; font-weight: bold; cursor: pointer; border: none; }
+ canvas { display: none; }
+ ul { list-style: none; padding: 0; }
+ li { background: #2a2a2a; padding: 10px; margin-bottom: 8px; border-radius: 6px; border-left: 4px solid var(--accent); }
+ </style>
+</head>
+<body>
+ <h1 style="text-align: center; color: var(--accent);">Student Attendance System</h1>
+ <div class="container">
+ <div class="card">
+ <h2>Live Camera</h2>
+ <video id="videoElement" autoplay playsinline></video>
+ <canvas id="canvas"></canvas>
+ </div>
+ <div>
+ <div class="card" style="margin-bottom: 20px;">
+ <h2>Register Student</h2>
+ <form id="registerForm">
+ <input type="text" id="studentName" placeholder="Student Name" required>
+ <button type="button" onclick="captureAndRegister()">Capture & Register</button>
+ </form>
+ <div id="statusMessage"></div>
+ </div>
+ <div class="card">
+ <h2>Attendance List</h2>
+ <ul id="attendanceList"></ul>
+ </div>
+ </div>
+ </div>
+ <script>
+ const video = document.getElementById('videoElement');
+ const canvas = document.getElementById('canvas');
+ 
+ // Start Webcam
+ async function startWebcam() {
+ try {
+ const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+ video.srcObject = stream;
+ } catch(err) { console.error("Error accessing webcam:", err); }
+ }
+ startWebcam();
 
+ // Register Student
+ async function captureAndRegister() {
+ const name = document.getElementById('studentName').value;
+ if(!name) { alert("Please enter a name"); return; }
 
-def _require_api_key() -> None:
-    if not GOOGLE_MAPS_API_KEY or GOOGLE_MAPS_API_KEY == "YOUR_GOOGLE_MAPS_API_KEY_HERE":
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "GOOGLE_MAPS_API_KEY አልተቀናበረም። Render → Environment ላይ "
-                "ትክክለኛ የGoogle Maps API ቁልፍ ያክሉ (Geocoding API እና Directions "
-                "API ሁለቱም መንቃት አለባቸው)."
-            ),
-        )
+ canvas.width = video.videoWidth;
+ canvas.height = video.videoHeight;
+ canvas.getContext('2d').drawImage(video, 0, 0);
+ const imageData = canvas.toDataURL('image/jpeg');
 
+ const response = await fetch('/register', {
+ method: 'POST',
+ headers: {'Content-Type': 'application/json'},
+ body: JSON.stringify({ name: name, image: imageData })
+ });
 
-_GOOGLE_STATUS_MESSAGES = {
-    "ZERO_RESULTS": "ቦታው አልተገኘም",
-    "OVER_QUERY_LIMIT": "የGoogle Maps ጥያቄ ገደብ ደርሷል፣ ትንሽ ቆይተው ይሞክሩ",
-    "REQUEST_DENIED": "የGoogle Maps API ቁልፍ ትክክል አይደለም ወይም Geocoding/Directions API አልነቃም",
-    "INVALID_REQUEST": "የተላከው ጥያቄ ትክክል አይደለም",
-}
+ const result = await response.json();
+ const statusDiv = document.getElementById('statusMessage');
+ statusDiv.innerText = result.message;
+ statusDiv.style.color = result.status === 'success' ? '#00e676' : '#ff5252';
+ if(result.status === 'success') document.getElementById('registerForm').reset();
+ }
 
+ // Process Attendance
+ async function processAttendance() {
+ if(video.readyState !== video.HAVE_ENOUGH_DATA) return;
+ canvas.width = video.videoWidth;
+ canvas.height = video.videoHeight;
+ canvas.getContext('2d').drawImage(video, 0, 0);
+ const imageData = canvas.toDataURL('image/jpeg');
 
-def _google_error_detail(status: str, fallback: str) -> str:
-    return _GOOGLE_STATUS_MESSAGES.get(status, fallback)
+ const response = await fetch('/mark_attendance', {
+ method: 'POST',
+ headers: {'Content-Type': 'application/json'},
+ body: JSON.stringify({ image: imageData })
+ });
 
+ const result = await response.json();
+ const list = document.getElementById('attendanceList');
+ list.innerHTML = '';
+ result.students.forEach(student => {
+ const li = document.createElement('li');
+ li.textContent = `✓ ${student}`;
+ list.appendChild(li);
+ });
+ }
+ setInterval(processAttendance, 5000);
+ </script>
+</body>
+</html>
+"""
 
-class GeocodeResult(BaseModel):
-    lat: float
-    lng: float
-    display_name: str
+@app.route('/')
+def index():
+ return render_template_string(HTML_TEMPLATE)
 
+@app.route('/register', methods=['POST'])
+def register():
+ data = request.json
+ name = data['name']
+ image_data = b64decode(data['image'].split(',')[1])
+ file_path = os.path.join(KNOWN_FACES_DIR, f"{name}.jpg")
+ with open(file_path, 'wb') as f:
+ f.write(image_data)
+ load_known_faces()
+ return jsonify({"status": "success", "message": f"{name} registered successfully!"})
 
-class RoutePoint(BaseModel):
-    lat: float
-    lng: float
+@app.route('/mark_attendance', methods=['POST'])
+def mark_attendance():
+ data = request.json
+ image_data = b64decode(data['image'].split(',')[1])
+ nparr = np.frombuffer(image_data, np.uint8)
+ frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+ rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+ face_locations = face_recognition.face_locations(rgb_frame)
+ face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
 
-class RouteRequest(BaseModel):
-    origin: RoutePoint
-    destination: RoutePoint
+ current_detected = []
+ for face_encoding in face_encodings:
+ matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+ if True in matches:
+ face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+ best_match_index = np.argmin(face_distances)
+ if matches[best_match_index]:
+ name = known_face_names[best_match_index]
+ attendance_records.add(name)
+ current_detected.append(name)
 
+ return jsonify({"students": list(attendance_records)})
 
-class RouteResult(BaseModel):
-    distance_km: float
-    duration_min: float
-    polyline: list[list[float]]
+def run_app():
+ app.run(port=5000)
 
-
-class ShareLocationRequest(BaseModel):
-    lat: float
-    lng: float
-    user_name: str | None = None
-
-
-class ShareLocationResult(BaseModel):
-    share_id: str
-    share_url: str
-    expires_at: str
-
-
-class SharedLocationResult(BaseModel):
-    lat: float
-    lng: float
-    user_name: str | None
-    expires_at: str
-
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "service": "niho-ride-location-service"}
-
-
-@app.get("/geocode", response_model=GeocodeResult)
-async def geocode(address: str):
-    """የቦታ ስም ተቀብሎ Google Geocoding API በመጠቀም lat/lng ይመልሳል።"""
-    _require_api_key()
-    formatted_address = f"{address}, Ethiopia"
-
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": formatted_address, "key": GOOGLE_MAPS_API_KEY}
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, params=params)
-    except httpx.RequestError:
-        raise HTTPException(status_code=502, detail="የGoogle Maps አገልግሎት ላይ መድረስ አልተቻለም")
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="የካርታ አገልግሎት ምላሽ አልሰጠም")
-
-    data = resp.json()
-    status = data.get("status")
-    if status != "OK" or not data.get("results"):
-        raise HTTPException(
-            status_code=404,
-            detail=_google_error_detail(status, f"'{address}' የሚባል ቦታ አልተገኘም"),
-        )
-
-    location = data["results"][0]["geometry"]["location"]
-    display_name = data["results"][0]["formatted_address"]
-
-    return GeocodeResult(lat=location["lat"], lng=location["lng"], display_name=display_name)
-
-
-@app.post("/route", response_model=RouteResult)
-async def get_route(req: RouteRequest):
-    """Google Directions API በመጠቀም ከመነሻ እስከ መድረሻ ያለውን መንገድ ያሰላል።"""
-    _require_api_key()
-    url = "https://maps.googleapis.com/maps/api/directions/json"
-    params = {
-        "origin": f"{req.origin.lat},{req.origin.lng}",
-        "destination": f"{req.destination.lat},{req.destination.lng}",
-        "key": GOOGLE_MAPS_API_KEY,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=params)
-    except httpx.RequestError:
-        raise HTTPException(status_code=502, detail="የGoogle Maps አገልግሎት ላይ መድረስ አልተቻለም")
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail="የመንገድ አገልግሎት ምላሽ አልሰጠም")
-
-    data = resp.json()
-    status = data.get("status")
-    if status != "OK" or not data.get("routes"):
-        raise HTTPException(
-            status_code=400,
-            detail=_google_error_detail(status, "ከመነሻ እስከ መድረሻ መንገድ ማግኘት አልተቻለም"),
-        )
-
-    route = data["routes"][0]
-    leg = route["legs"][0]
-
-    encoded_polyline = route["overview_polyline"]["points"]
-    try:
-        decoded_points = decode_polyline(encoded_polyline)
-    except (IndexError, ValueError):
-        raise HTTPException(status_code=502, detail="የመንገድ መስመር መፍታት (decode) አልተቻለም")
-
-    return RouteResult(
-        distance_km=round(leg["distance"]["value"] / 1000, 2),
-        duration_min=round(leg["duration"]["value"] / 60, 1),
-        polyline=decoded_points,
-    )
-
-
-@app.post("/share-location", response_model=ShareLocationResult)
-async def share_location(req: ShareLocationRequest):
-    """የተጠቃሚን የአሁን መገኛ ቦታ ለ2 ሰዓት ብቻ የሚቆይ ማጋሪያ ሊንክ ይፈጥራል።"""
-    share_id = uuid.uuid4().hex[:8]
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
-
-    shared_locations[share_id] = {
-        "lat": req.lat,
-        "lng": req.lng,
-        "user_name": req.user_name,
-        "expires_at": expires_at,
-    }
-
-    return ShareLocationResult(
-        share_id=share_id,
-        share_url=f"https://ride-api-3.onrender.com/track/{share_id}",
-        expires_at=expires_at.isoformat(),
-    )
-
-
-@app.get("/shared-location/{share_id}", response_model=SharedLocationResult)
-async def get_shared_location(share_id: str):
-    """የተጋራ ሊንክ ተከትሎ የቦታውን lat/lng ይመልሳል (ገና ካላበቃ)።"""
-    entry = shared_locations.get(share_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail="ሊንኩ አልተገኘም ወይም ጊዜው አልፎበታል")
-
-    if datetime.now(timezone.utc) > entry["expires_at"]:
-        del shared_locations[share_id]
-        raise HTTPException(status_code=410, detail="የማጋሪያ ሊንኩ ጊዜው አልፎበታል")
-
-    return SharedLocationResult(
-        lat=entry["lat"],
-        lng=entry["lng"],
-        user_name=entry["user_name"],
-        expires_at=entry["expires_at"].isoformat(),
-    )
-
-
-def decode_polyline(polyline_str: str) -> list[list[float]]:
-    """Decodes a Google encoded polyline string into [lat, lng] pairs."""
-    if not polyline_str:
-        raise ValueError("empty polyline")
-
-    index, lat, lng = 0, 0, 0
-    coordinates = []
-    length = len(polyline_str)
-
-    while index < length:
-        result, shift = 0, 0
-        while True:
-            if index >= length:
-                raise IndexError("truncated polyline")
-            b = ord(polyline_str[index]) - 63
-            index += 1
-            result |= (b & 0x1F) << shift
-            shift += 5
-            if b < 0x20:
-                break
-        dlat = ~(result >> 1) if (result & 1) else (result >> 1)
-        lat += dlat
-
-        result, shift = 0, 0
-        while True:
-            if index >= length:
-                raise IndexError("truncated polyline")
-            b = ord(polyline_str[index]) - 63
-            index += 1
-            result |= (b & 0x1F) << shift
-            shift += 5
-            if b < 0x20:
-                break
-        dlng = ~(result >> 1) if (result & 1) else (result >> 1)
-        lng += dlng
-
-        coordinates.append([lat / 1e5, lng / 1e5])
-
-    return coordinates
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    # Render injects $PORT — bind to it so the service is reachable even if
-    # your start command doesn't pass --port explicitly.
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+if __name__ == '__main__':
+ from pyngrok import ngrok
+ port = 5000
+ public_url = ngrok.connect(port).public_url
+ print(' * ngrok tunnel \"{}\" -> \"http://127.0.0.1:{}\"'.format(public_url, port))
+ 
+ threading.Thread(target=run_app).start()
