@@ -1,4 +1,5 @@
-fastapi
-uvicorn
-httpx
-pydantic
+flask
+opencv-python
+numpy
+face_recognition
+gunicorn
